@@ -18,3 +18,4 @@ nest_asyncio==1.6.0
 mcp==1.28.1
 certifi==2026.6.17
 streamlit==1.42.0
+uv 
