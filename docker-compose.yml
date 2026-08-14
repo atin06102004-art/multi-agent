@@ -1,0 +1,14 @@
+services:
+  streamlit:
+    build: .
+    env_file: .env
+    ports:
+      - "8501:8501"
+    command: ["streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
