@@ -61,11 +61,6 @@ if not GROQ_API_KEY:
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=GROQ_API_KEY,
-    # Groq's free/on-demand tier caps this model at 8000 tokens/min, and
-    # that cap covers prompt + completion together. Bounding completion
-    # size here leaves more of that budget for the (already-clipped)
-    # prompt content.
-    max_tokens=900,
 )
 
 # =========================
@@ -120,8 +115,11 @@ AGENT_ORDER = [
 ]
 
 
-def _llm_text(system_prompt: str, user_prompt: str) -> str:
-    response = llm.invoke(
+def _llm_text(system_prompt: str, user_prompt: str, max_tokens: int = 400) -> str:
+    # Per-call token cap: Groq's on-demand tier caps this model at 8000
+    # tokens/min, counting prompt + completion together, so each call gets
+    # a budget sized to what that step actually needs to produce.
+    response = llm.bind(max_tokens=max_tokens).invoke(
         [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt),
@@ -354,7 +352,7 @@ def flight_agent(state: TravelState):
             airline_data=str(airlines)[:900],
         )
 
-        response = llm.invoke(
+        response = llm.bind(max_tokens=700).invoke(
             [
                 SystemMessage(content="You are an expert travel flight planner."),
                 HumanMessage(content=prompt),
@@ -495,7 +493,7 @@ Return:
 If exact live prices are unavailable, clearly label estimates as approximate.
 """
 
-    response = llm.invoke(
+    response = llm.bind(max_tokens=600).invoke(
         [
             SystemMessage(content="You are a practical travel budget analyst."),
             HumanMessage(content=prompt),
@@ -575,7 +573,7 @@ Make the itinerary practical and easy to follow. This is a clear draft
 ready for human review.
 """
 
-    response = llm.invoke(
+    response = llm.bind(max_tokens=2200).invoke(
         [
             SystemMessage(content="You are an expert travel planner."),
             HumanMessage(content=prompt),
@@ -725,7 +723,7 @@ Important:
 - Keep the response useful for real travel planning.
 """
 
-    response = llm.invoke(
+    response = llm.bind(max_tokens=2600).invoke(
         [
             SystemMessage(
                 content="You are a professional AI travel booking assistant."
