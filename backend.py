@@ -14,6 +14,7 @@ import json
 import psycopg
 from psycopg.rows import dict_row
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
 from langgraph.checkpoint.postgres import PostgresSaver
 from langchain_core.messages import (
     AnyMessage,
@@ -85,6 +86,11 @@ class TravelState(TypedDict, total=False):
     # New budget state
     budget_results: str
     final_response: str
+
+    # Human-in-the-loop state
+    hitl_approved: bool
+    hitl_feedback: str
+    revision_count: int
 
     llm_calls: int
 
@@ -491,11 +497,23 @@ If exact live prices are unavailable, clearly label estimates as approximate.
 # Itinerary Agent - original behavior extended with selected results
 # =========================
 def itinerary_agent(state: TravelState):
+    revision_feedback = state.get("hitl_feedback", "")
+    revision_note = (
+        f"""
+The user reviewed the previous draft and requested changes. Revise the
+itinerary to address this feedback directly, keeping everything else that
+still applies:
+{revision_feedback}
+"""
+        if revision_feedback
+        else ""
+    )
+
     prompt = f"""
 Create a complete travel itinerary using the research below. This draft is
 shown directly to the user for approval, so it must surface the actual
 findings from each specialist agent, not generic placeholder advice.
-
+{revision_note}
 User Query:
 {state['user_query']}
 
@@ -550,8 +568,55 @@ ready for human review.
 
     return {
         "itinerary": response.content,
+        # Clear any prior feedback/decision now that a fresh draft exists,
+        # and mark it as not-yet-approved so routing sends it to the human
+        # approval node instead of straight through to final_agent.
+        "hitl_approved": False,
+        "hitl_feedback": "",
         "messages": [AIMessage(content="Draft itinerary created.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
+    }
+
+
+# =========================
+# Human-in-the-Loop: approval gate
+# =========================
+def human_approval_agent(state: TravelState):
+    """Pause the graph and hand the draft itinerary to the user.
+
+    Resuming happens via ``Command(resume={"approved": bool, "feedback": str})``
+    passed to ``travel_graph.invoke``/``.stream`` with the same thread_id. See
+    ``resume_travel_agent`` below.
+    """
+    decision = interrupt(
+        {
+            "type": "itinerary_approval",
+            "question": (
+                "Here's the draft itinerary. Approve it, or describe what "
+                "should change."
+            ),
+            "itinerary": state.get("itinerary", ""),
+        }
+    )
+
+    approved = bool(decision.get("approved", False)) if isinstance(decision, dict) else False
+    feedback = (
+        str(decision.get("feedback", "")).strip()
+        if isinstance(decision, dict)
+        else ""
+    )
+
+    summary = (
+        "User approved the draft itinerary."
+        if approved
+        else f"User requested revisions: {feedback or '(no details given)'}"
+    )
+
+    return {
+        "hitl_approved": approved,
+        "hitl_feedback": feedback,
+        "revision_count": state.get("revision_count", 0) + (0 if approved else 1),
+        "messages": [AIMessage(content=summary)],
     }
 
 
@@ -700,6 +765,20 @@ def route_after_agent(current_agent: str):
     return route
 
 
+# Cap revision loops so a stuck/ambiguous feedback cycle can't loop forever.
+MAX_REVISIONS = 3
+
+
+def route_after_approval(state: TravelState) -> str:
+    if state.get("hitl_approved", False):
+        return "final_agent"
+    if state.get("revision_count", 0) >= MAX_REVISIONS:
+        # Out of revision attempts - finalize with whatever draft exists
+        # rather than looping indefinitely.
+        return "final_agent"
+    return "itinerary_agent"
+
+
 # =========================
 # Build Graph
 # =========================
@@ -712,6 +791,7 @@ graph.add_node("hotel_agent", hotel_agent)
 graph.add_node("weather_agent", weather_agent)
 graph.add_node("budget_agent", budget_agent)
 graph.add_node("itinerary_agent", itinerary_agent)
+graph.add_node("human_approval", human_approval_agent)
 graph.add_node("final_agent", final_agent)
 
 graph.add_edge(START, "supervisor")
@@ -730,7 +810,12 @@ graph.add_conditional_edges(
     "budget_agent", route_after_agent("budget_agent"), ROUTE_MAP
 )
 
-graph.add_edge("itinerary_agent", "final_agent")
+graph.add_edge("itinerary_agent", "human_approval")
+graph.add_conditional_edges(
+    "human_approval",
+    route_after_approval,
+    {"final_agent": "final_agent", "itinerary_agent": "itinerary_agent"},
+)
 graph.add_edge("final_agent", END)
 graph.add_edge("guardrail_blocked", END)
 
@@ -756,12 +841,43 @@ def _serialize_result(
     result: dict[str, Any],
     thread_id: str,
 ) -> dict[str, Any]:
+    # When the graph is paused at the human_approval node, invoke()/ainvoke()
+    # returns the state so far plus an "__interrupt__" key holding the
+    # Interrupt object(s) raised by interrupt(). Surface that as a distinct
+    # "awaiting approval" response instead of treating it as a final answer.
+    interrupts = result.get("__interrupt__") or []
+    if interrupts:
+        payload = interrupts[0].value or {}
+        draft_itinerary = payload.get("itinerary") or result.get("itinerary", "")
+        question = payload.get(
+            "question",
+            "Here's the draft itinerary. Approve it, or describe what should change.",
+        )
+
+        return {
+            "thread_id": thread_id,
+            "requires_approval": True,
+            "answer": question,
+            "flight_results": result.get("flight_results", ""),
+            "hotel_results": result.get("hotel_results", ""),
+            "weather_results": result.get("weather_results", ""),
+            "budget_results": result.get("budget_results", ""),
+            "itinerary": draft_itinerary,
+            "selected_agents": result.get("selected_agents", []),
+            "trip_constraints": result.get("trip_constraints", {}),
+            "supervisor_reasoning": result.get("supervisor_reasoning", ""),
+            "guardrail_allowed": result.get("guardrail_allowed", True),
+            "guardrail_reason": result.get("guardrail_reason", ""),
+            "llm_calls": result.get("llm_calls", 0),
+        }
+
     messages = result.get("messages", [])
     last_message = messages[-1].content if messages else ""
     answer = result.get("final_response") or last_message
 
     return {
         "thread_id": thread_id,
+        "requires_approval": False,
         "answer": answer,
         "flight_results": result.get("flight_results", ""),
         "hotel_results": result.get("hotel_results", ""),
@@ -778,7 +894,12 @@ def _serialize_result(
 
 
 def run_travel_agent(user_input: str, thread_id: str | None = None):
-    """Run a travel-planning request through the full agent graph."""
+    """Run a travel-planning request through the full agent graph.
+
+    Stops (returns with requires_approval=True) once the graph reaches the
+    human_approval node. Call ``resume_travel_agent`` with the same
+    thread_id to continue.
+    """
     if not thread_id:
         thread_id = f"user_{uuid.uuid4().hex}"
 
@@ -799,8 +920,32 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
             "budget_results": "",
             "itinerary": "",
             "final_response": "",
+            "hitl_approved": False,
+            "hitl_feedback": "",
+            "revision_count": 0,
             "llm_calls": 0,
         },
+        config=config,
+    )
+
+    return _serialize_result(result, thread_id)
+
+
+def resume_travel_agent(
+    thread_id: str,
+    approved: bool,
+    feedback: str = "",
+):
+    """Resume a graph paused at the human_approval interrupt.
+
+    ``approved=True`` sends the draft straight to final_agent.
+    ``approved=False`` sends ``feedback`` back to itinerary_agent for a
+    revised draft, which pauses again at human_approval.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+
+    result = travel_graph.invoke(
+        Command(resume={"approved": approved, "feedback": feedback}),
         config=config,
     )
 
