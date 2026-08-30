@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from backend import run_travel_agent
+from backend import run_travel_agent, resume_travel_agent
 
 # Kept from the original project so the synchronous LangGraph agent
 # functions can call async MCP helpers while running inside FastAPI's
@@ -65,13 +65,19 @@ class TravelRequest(BaseModel):
     thread_id: str | None = None
 
 
+class ApprovalRequest(BaseModel):
+    thread_id: str
+    approved: bool
+    feedback: str | None = None
+
+
 @app.get("/")
 async def root():
     return {
         "service": "TripMate AI API",
         "docs": "/docs",
         "health": "/health",
-        "endpoints": ["/api/travel"],
+        "endpoints": ["/api/travel", "/api/travel/approve"],
     }
 
 
@@ -114,6 +120,35 @@ async def travel_planner(request_data: TravelRequest):
         )
 
 
+@app.post("/api/travel/approve")
+async def approve_travel(request_data: ApprovalRequest):
+    try:
+        result = resume_travel_agent(
+            thread_id=request_data.thread_id,
+            approved=request_data.approved,
+            feedback=(request_data.feedback or "").strip(),
+        )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                **result,
+            }
+        )
+
+    except Exception as exc:
+        print("ERROR:", exc)
+        traceback.print_exc()
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(exc),
+            },
+        )
+
+
 @app.get("/health")
 async def health_check():
     return {
@@ -123,6 +158,7 @@ async def health_check():
             "supervisor_agent",
             "input_guardrail",
             "mcp_tools",
+            "human_in_the_loop",
         ],
     }
 
