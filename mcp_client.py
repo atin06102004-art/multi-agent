@@ -68,6 +68,7 @@ def _subprocess_env(**updates: str | None) -> dict[str, str]:
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=_require_env("GROQ_API_KEY", GROQ_API_KEY),
+    max_tokens=300,
 )
 
 
