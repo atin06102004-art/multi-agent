@@ -61,6 +61,11 @@ if not GROQ_API_KEY:
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=GROQ_API_KEY,
+    # Groq's free/on-demand tier caps this model at 8000 tokens/min, and
+    # that cap covers prompt + completion together. Bounding completion
+    # size here leaves more of that budget for the (already-clipped)
+    # prompt content.
+    max_tokens=900,
 )
 
 # =========================
@@ -145,6 +150,17 @@ def _empty_constraints() -> dict[str, Any]:
         "travel_style": "",
         "special_preferences": [],
     }
+
+
+def _clip(text: str, max_chars: int = 900) -> str:
+    """Cap a block of text going into a prompt so a chain of specialist
+    results (flight/hotel/weather/budget/itinerary) can't blow past Groq's
+    per-minute token limit when they're all concatenated into one prompt.
+    """
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n…(truncated)"
 
 
 # =========================
@@ -334,8 +350,8 @@ def flight_agent(state: TravelState):
 
         prompt = FLIGHT_AGENT_PROMPT.format(
             query=query,
-            airport_data=str(airports)[:3000],
-            airline_data=str(airlines)[:3000],
+            airport_data=str(airports)[:900],
+            airline_data=str(airlines)[:900],
         )
 
         response = llm.invoke(
@@ -462,13 +478,13 @@ Trip Constraints:
 {state.get('trip_constraints', {})}
 
 Flight Results:
-{state.get('flight_results', '')}
+{_clip(state.get('flight_results', ''))}
 
 Hotel Results:
-{state.get('hotel_results', '')}
+{_clip(state.get('hotel_results', ''))}
 
 Weather Results:
-{state.get('weather_results', '')}
+{_clip(state.get('weather_results', ''))}
 
 Return:
 1. Estimated cost categories
@@ -521,16 +537,16 @@ Trip Constraints:
 {state.get('trip_constraints', {})}
 
 Flight Results (from the flight agent):
-{state.get('flight_results', '') or 'Not researched for this request.'}
+{_clip(state.get('flight_results', '')) or 'Not researched for this request.'}
 
 Hotel Results (from the hotel agent):
-{state.get('hotel_results', '') or 'Not researched for this request.'}
+{_clip(state.get('hotel_results', '')) or 'Not researched for this request.'}
 
 Weather Results (from the weather agent, includes current temperature and forecast):
-{state.get('weather_results', '') or 'Not researched for this request.'}
+{_clip(state.get('weather_results', '')) or 'Not researched for this request.'}
 
 Budget Results (from the budget agent):
-{state.get('budget_results', '') or 'Not researched for this request.'}
+{_clip(state.get('budget_results', '')) or 'Not researched for this request.'}
 
 Structure the draft with these sections, in this order:
 1. Trip Overview — destination, dates/duration, origin if known
@@ -634,19 +650,19 @@ Supervisor Constraints:
 {state.get('trip_constraints', {})}
 
 Flights (one bullet per airline, each paired with its own fare range — never one combined range for all airlines):
-{state.get('flight_results', '') or 'Not researched for this request.'}
+{_clip(state.get('flight_results', '')) or 'Not researched for this request.'}
 
 Hotels (one bullet per hotel, each hotel name paired directly with its own price range — never listed separately from prices):
-{state.get('hotel_results', '') or 'Not researched for this request.'}
+{_clip(state.get('hotel_results', '')) or 'Not researched for this request.'}
 
 Weather (detailed bullets, broken out per city if more than one city — separate bullets for current temp, feels-like, humidity, condition, forecast range):
-{state.get('weather_results', '') or 'Not researched for this request.'}
+{_clip(state.get('weather_results', '')) or 'Not researched for this request.'}
 
 Budget Analysis (use the figures below):
-{state.get('budget_results', '') or 'Not researched for this request.'}
+{_clip(state.get('budget_results', '')) or 'Not researched for this request.'}
 
 Draft Itinerary:
-{state.get('itinerary', '')}
+{_clip(state.get('itinerary', ''), max_chars=1600)}
 
 Format the final answer as clean Markdown, following this exact structure
 (this renders directly in the app, so the Markdown syntax matters):
